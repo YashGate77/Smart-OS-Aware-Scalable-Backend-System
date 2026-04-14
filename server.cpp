@@ -1,6 +1,7 @@
 #include <iostream>
 #include <cstring>
 #include <string>
+#include <sstream>
 #include <winsock2.h>
 #include <thread>
 #include <mutex>
@@ -10,10 +11,73 @@
 #include <list>
 #include <unordered_map>
 #include <mysql.h>
+#include <ctime>
+#include <cstdlib>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "libmysql.lib")
 using namespace std;
+
+// ─────────────────────────────────────────
+//  TOKEN MANAGER
+// ─────────────────────────────────────────
+class TokenManager {
+public:
+    // Generate a unique token
+    string generateToken(const string& username) {
+        unique_lock<mutex> lock(tokenMutex);
+
+        // token = "TKN_username_randomNumber"
+        string token = "TKN_" + username + "_"
+                     + to_string(rand() % 900000 + 100000);
+
+        // Store token → username mapping
+        tokenStore[token] = username;
+        cout << "[Token] Generated for "
+             << username << ": " << token << "\n";
+        return token;
+    }
+
+    // Validate token — returns username or ""
+    string validateToken(const string& token) {
+        unique_lock<mutex> lock(tokenMutex);
+        auto it = tokenStore.find(token);
+        if (it != tokenStore.end()) {
+            cout << "[Token] Valid token for: "
+                 << it->second << "\n";
+            return it->second;
+        }
+        cout << "[Token] Invalid token: " << token << "\n";
+        return "";
+    }
+
+    // Delete token on logout
+    bool deleteToken(const string& token) {
+        unique_lock<mutex> lock(tokenMutex);
+        auto it = tokenStore.find(token);
+        if (it != tokenStore.end()) {
+            cout << "[Token] Deleted token for: "
+                 << it->second << "\n";
+            tokenStore.erase(it);
+            return true;
+        }
+        return false;
+    }
+
+    // List all active tokens
+    string listTokens() {
+        unique_lock<mutex> lock(tokenMutex);
+        string result = "";
+        for (auto& pair : tokenStore)
+            result += pair.second + " → "
+                    + pair.first + "\n";
+        return result.empty() ? "No active tokens" : result;
+    }
+
+private:
+    unordered_map<string, string> tokenStore;
+    mutex tokenMutex;
+};
 
 // ─────────────────────────────────────────
 //  LRU CACHE
@@ -21,101 +85,58 @@ using namespace std;
 class LRUCache {
 public:
     int capacity;
-    int hits   = 0;   // cache hit counter
-    int misses = 0;   // cache miss counter
+    int hits = 0, misses = 0;
 
-    LRUCache(int cap) : capacity(cap) {
-        cout << "[Cache] LRU Cache initialized. "
-             << "Capacity: " << cap << " items\n";
-    }
+    LRUCache(int cap) : capacity(cap) {}
 
-    // ── GET: returns "" if not found ──────
     string get(const string& key) {
         unique_lock<mutex> lock(cacheMutex);
-
         auto it = cacheMap.find(key);
         if (it == cacheMap.end()) {
             misses++;
-            cout << "[Cache] MISS → " << key
-                 << " | Hits: " << hits
-                 << " Misses: " << misses << "\n";
-            return "";  // not in cache
+            return "";
         }
-
-        // Move to front (most recently used)
         cacheList.splice(cacheList.begin(),
                          cacheList, it->second);
         hits++;
-        cout << "[Cache] HIT  → " << key
-             << " | Hits: " << hits
-             << " Misses: " << misses << "\n";
         return it->second->second;
     }
 
-    // ── PUT: add/update item in cache ─────
-    void put(const string& key, const string& value) {
+    void put(const string& key, const string& val) {
         unique_lock<mutex> lock(cacheMutex);
-
         auto it = cacheMap.find(key);
-
-        // If key exists — update and move to front
         if (it != cacheMap.end()) {
-            it->second->second = value;
+            it->second->second = val;
             cacheList.splice(cacheList.begin(),
                              cacheList, it->second);
-            cout << "[Cache] UPDATED → " << key << "\n";
             return;
         }
-
-        // If cache is full — evict LRU (back of list)
         if ((int)cacheList.size() >= capacity) {
-            string evictedKey = cacheList.back().first;
-            cacheMap.erase(evictedKey);
+            cacheMap.erase(cacheList.back().first);
             cacheList.pop_back();
-            cout << "[Cache] EVICTED → " << evictedKey << "\n";
         }
-
-        // Insert at front (most recently used)
-        cacheList.emplace_front(key, value);
+        cacheList.emplace_front(key, val);
         cacheMap[key] = cacheList.begin();
-        cout << "[Cache] STORED → " << key
-             << " | Size: " << cacheList.size() << "\n";
     }
 
-    // ── INVALIDATE: remove specific key ───
     void invalidate(const string& key) {
         unique_lock<mutex> lock(cacheMutex);
         auto it = cacheMap.find(key);
         if (it != cacheMap.end()) {
             cacheList.erase(it->second);
             cacheMap.erase(it);
-            cout << "[Cache] INVALIDATED → " << key << "\n";
         }
     }
 
-    // ── STATS: hit rate ───────────────────
-    void printStats() {
-        int total = hits + misses;
-        float rate = total > 0
-            ? (float)hits / total * 100 : 0;
-        cout << "[Cache] Stats → "
-             << "Hits: "   << hits
-             << " Misses: " << misses
-             << " Hit Rate: " << rate << "%\n";
-    }
-
 private:
-    list<pair<string,string>>                    cacheList;
+    list<pair<string,string>> cacheList;
     unordered_map<string,
-        list<pair<string,string>>::iterator>     cacheMap;
+        list<pair<string,string>>::iterator> cacheMap;
     mutex cacheMutex;
 };
 
-// Global cache — capacity 5 items
-LRUCache cache(5);
-
 // ─────────────────────────────────────────
-//  DATABASE MANAGER
+//  DATABASE
 // ─────────────────────────────────────────
 class Database {
 public:
@@ -127,22 +148,19 @@ public:
         if (!mysql_real_connect(conn,
                 "localhost", "root", "1877",
                 "os_project", 3306, NULL, 0)) {
-            cout << "[DB] Connection failed: "
+            cout << "[DB] Failed: "
                  << mysql_error(conn) << "\n";
         } else {
             cout << "[DB] Connected to MySQL!\n";
         }
     }
 
-    ~Database() {
-        if (conn) mysql_close(conn);
-    }
+    ~Database() { if (conn) mysql_close(conn); }
 
-    bool checkUser(const string& user,
-                   const string& pass) {
+    bool checkUser(const string& u, const string& p) {
         unique_lock<mutex> lock(dbMutex);
         string q = "SELECT * FROM users WHERE username='"
-                 + user + "' AND password='" + pass + "'";
+                 + u + "' AND password='" + p + "'";
         if (mysql_query(conn, q.c_str())) return false;
         MYSQL_RES* r = mysql_store_result(conn);
         bool found = mysql_num_rows(r) > 0;
@@ -154,6 +172,13 @@ public:
                     const string& priority,
                     int workerId) {
         unique_lock<mutex> lock(dbMutex);
+        mysql_query(conn,
+            "SELECT COUNT(*) FROM request_logs");
+        MYSQL_RES* r = mysql_store_result(conn);
+        MYSQL_ROW row = mysql_fetch_row(r);
+        int count = stoi(string(row[0]));
+        mysql_free_result(r);
+        if (count >= 1000) return;
         string q = "INSERT INTO request_logs "
                    "(path, priority, handled_by) VALUES ('"
                  + path + "','" + priority + "',"
@@ -161,57 +186,59 @@ public:
         mysql_query(conn, q.c_str());
     }
 
-    string getLogs() {
+    string getUsersJSON() {
+        unique_lock<mutex> lock(dbMutex);
+        if (mysql_query(conn,
+            "SELECT id, username FROM users"))
+            return "[]";
+        MYSQL_RES* r = mysql_store_result(conn);
+        string json = "[";
+        MYSQL_ROW row;
+        bool first = true;
+        while ((row = mysql_fetch_row(r))) {
+            if (!first) json += ",";
+            json += "{\"id\":" + string(row[0])
+                  + ",\"username\":\"" + string(row[1])
+                  + "\"}";
+            first = false;
+        }
+        json += "]";
+        mysql_free_result(r);
+        return json;
+    }
+
+    string getLogsJSON() {
         unique_lock<mutex> lock(dbMutex);
         if (mysql_query(conn,
             "SELECT * FROM request_logs "
             "ORDER BY log_time DESC LIMIT 10"))
-            return "Query failed.";
-
+            return "[]";
         MYSQL_RES* r = mysql_store_result(conn);
-        string html =
-            "<table border='1' style='border-collapse:"
-            "collapse;width:100%;color:white'>"
-            "<tr style='background:#2E75B6'>"
-            "<th>ID</th><th>Path</th><th>Priority</th>"
-            "<th>Worker</th><th>Time</th></tr>";
+        string json = "[";
         MYSQL_ROW row;
-        while ((row = mysql_fetch_row(r)))
-            html += "<tr><td>" + string(row[0]) +
-                    "</td><td>" + string(row[1]) +
-                    "</td><td>" + string(row[2]) +
-                    "</td><td>" + string(row[3]) +
-                    "</td><td>" + string(row[4]) +
-                    "</td></tr>";
-        html += "</table>";
+        bool first = true;
+        while ((row = mysql_fetch_row(r))) {
+            if (!first) json += ",";
+            json += "{\"id\":"    + string(row[0])
+                  + ",\"path\":\"" + string(row[1])
+                  + "\",\"priority\":\"" + string(row[2])
+                  + "\",\"worker\":" + string(row[3])
+                  + ",\"time\":\"" + string(row[4])
+                  + "\"}";
+            first = false;
+        }
+        json += "]";
         mysql_free_result(r);
-        return html;
-    }
-
-    string getUsers() {
-        unique_lock<mutex> lock(dbMutex);
-        if (mysql_query(conn,
-            "SELECT id, username FROM users"))
-            return "Query failed.";
-
-        MYSQL_RES* r = mysql_store_result(conn);
-        string html =
-            "<table border='1' style='border-collapse:"
-            "collapse;width:100%;color:white'>"
-            "<tr style='background:#27ae60'>"
-            "<th>ID</th><th>Username</th></tr>";
-        MYSQL_ROW row;
-        while ((row = mysql_fetch_row(r)))
-            html += "<tr><td>" + string(row[0]) +
-                    "</td><td>" + string(row[1]) +
-                    "</td></tr>";
-        html += "</table>";
-        mysql_free_result(r);
-        return html;
+        return json;
     }
 };
 
-Database db;
+// ─────────────────────────────────────────
+//  GLOBALS
+// ─────────────────────────────────────────
+Database     db;
+LRUCache     cache(5);
+TokenManager tokenMgr;
 
 // ─────────────────────────────────────────
 //  REQUEST STRUCT
@@ -220,40 +247,81 @@ struct Request {
     SOCKET socket;
     int    priority;
     string path;
+    string method;
+    string body;
+    string headers;
+
     bool operator>(const Request& o) const {
         return priority > o.priority;
     }
 };
 
 // ─────────────────────────────────────────
-//  HELPERS
+//  HTTP PARSER
 // ─────────────────────────────────────────
-string extractPath(const string& raw) {
-    size_t s = raw.find(' ');
-    if (s == string::npos) return "/";
-    size_t e = raw.find(' ', s + 1);
-    if (e == string::npos) return "/";
-    return raw.substr(s + 1, e - s - 1);
+struct ParsedRequest {
+    string method;   // GET, POST, DELETE
+    string path;     // /api/login
+    string body;     // {"username":"yash",...}
+    string headers;  // full headers
+};
+
+ParsedRequest parseHTTP(const string& raw) {
+    ParsedRequest pr;
+    istringstream stream(raw);
+    string line;
+
+    // First line: "POST /api/login HTTP/1.1"
+    getline(stream, line);
+    istringstream firstLine(line);
+    firstLine >> pr.method >> pr.path;
+
+    // Read headers
+    string headerSection = "";
+    while (getline(stream, line) && line != "\r")
+        headerSection += line + "\n";
+    pr.headers = headerSection;
+
+    // Read body (after blank line)
+    string bodySection = "";
+    while (getline(stream, line))
+        bodySection += line;
+    pr.body = bodySection;
+
+    return pr;
 }
 
-string extractParam(const string& path,
-                    const string& key) {
-    size_t pos = path.find(key + "=");
+// Extract JSON value: {"username":"yash"} → "yash"
+string extractJSON(const string& json,
+                   const string& key) {
+    string search = "\"" + key + "\":\"";
+    size_t pos = json.find(search);
     if (pos == string::npos) return "";
-    pos += key.size() + 1;
-    size_t end = path.find('&', pos);
-    return end == string::npos
-        ? path.substr(pos)
-        : path.substr(pos, end - pos);
+    pos += search.size();
+    size_t end = json.find("\"", pos);
+    return json.substr(pos, end - pos);
+}
+
+// Extract token from headers
+// "Authorization: Bearer TKN_yash_123"
+string extractToken(const string& headers) {
+    string search = "Authorization: Bearer ";
+    size_t pos = headers.find(search);
+    if (pos == string::npos) return "";
+    pos += search.size();
+    size_t end = headers.find("\n", pos);
+    string token = headers.substr(pos, end - pos);
+    // trim \r if present
+    if (!token.empty() && token.back() == '\r')
+        token.pop_back();
+    return token;
 }
 
 int getPriority(const string& path) {
-    if (path.find("/high")   != string::npos) return 1;
-    if (path.find("/login")  != string::npos) return 1;
-    if (path.find("/normal") != string::npos) return 2;
-    if (path.find("/users")  != string::npos) return 2;
-    if (path.find("/logs")   != string::npos) return 2;
-    if (path.find("/low")    != string::npos) return 3;
+    if (path.find("/api/login")  != string::npos) return 1;
+    if (path.find("/api/logout") != string::npos) return 1;
+    if (path.find("/api/users")  != string::npos) return 2;
+    if (path.find("/api/logs")   != string::npos) return 2;
     return 2;
 }
 
@@ -264,28 +332,59 @@ string getPriorityLabel(int p) {
 }
 
 // ─────────────────────────────────────────
+//  RESPONSE BUILDERS
+// ─────────────────────────────────────────
+string jsonResponse(int code, const string& body) {
+    string status =
+        code == 200 ? "200 OK" :
+        code == 201 ? "201 Created" :
+        code == 401 ? "401 Unauthorized" :
+        code == 404 ? "404 Not Found" :
+                      "500 Internal Server Error";
+    return "HTTP/1.1 " + status + "\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: " + to_string(body.size())
+         + "\r\n"
+           "Access-Control-Allow-Origin: *\r\n"
+           "Connection: close\r\n"
+           "\r\n" + body;
+}
+
+string htmlResponse(const string& body) {
+    return "HTTP/1.1 200 OK\r\n"
+           "Content-Type: text/html\r\n"
+           "Content-Length: " + to_string(body.size())
+         + "\r\n"
+           "Connection: close\r\n"
+           "\r\n" + body;
+}
+
+// ─────────────────────────────────────────
 //  THREAD POOL
 // ─────────────────────────────────────────
 class ThreadPool {
 public:
     ThreadPool(int n) {
-        cout << "[ThreadPool] Starting " << n
-             << " workers...\n";
         for (int i = 0; i < n; i++)
             workers.emplace_back(
                 &ThreadPool::workerFunction, this, i);
     }
 
     void addTask(SOCKET sock, const string& raw) {
-        string path = extractPath(raw);
+        ParsedRequest pr = parseHTTP(raw);
         Request req;
         req.socket   = sock;
-        req.priority = getPriority(path);
-        req.path     = path;
+        req.method   = pr.method;
+        req.path     = pr.path;
+        req.body     = pr.body;
+        req.headers  = pr.headers;
+        req.priority = getPriority(pr.path);
+
         {
             unique_lock<mutex> lock(qMutex);
             taskQueue.push(req);
-            cout << "[Scheduler] Queued: " << path
+            cout << "[Scheduler] " << req.method
+                 << " " << req.path
                  << " [" << getPriorityLabel(req.priority)
                  << "]\n";
         }
@@ -308,7 +407,6 @@ private:
     bool               stop = false;
 
     void workerFunction(int id) {
-        cout << "[Worker " << id << "] Ready.\n";
         while (true) {
             Request req;
             {
@@ -324,243 +422,225 @@ private:
         }
     }
 
-    // ─────────────────────────────────────
-    //  HANDLE CLIENT — Cache integrated
-    // ─────────────────────────────────────
     void handleClient(const Request& req, int wid) {
-        string path  = req.path;
-        string label = getPriorityLabel(req.priority);
-        string body;
-        bool   fromCache = false;
+        string method  = req.method;
+        string path    = req.path;
+        string body    = req.body;
+        string headers = req.headers;
+        string label   = getPriorityLabel(req.priority);
+        string response;
 
-        // ── ROUTE: /login ─────────────────
-        if (path.find("/login") != string::npos) {
-            string user = extractParam(path, "user");
-            string pass = extractParam(path, "pass");
+        cout << "[Worker " << wid << "] "
+             << method << " " << path << "\n";
 
-            // Cache key = "login:yash:1234"
-            string cacheKey = "login:" + user + ":" + pass;
-            string cached   = cache.get(cacheKey);
+        // ══════════════════════════════════
+        //  POST /api/login
+        //  Body: {"username":"yash","password":"1234"}
+        // ══════════════════════════════════
+        if (method == "POST" &&
+            path == "/api/login") {
 
-            if (!cached.empty()) {
-                // CACHE HIT — no DB query needed!
-                body      = cached;
-                fromCache = true;
-                cout << "[Worker " << wid
-                     << "] Login served from CACHE!\n";
+            string user = extractJSON(body, "username");
+            string pass = extractJSON(body, "password");
+
+            if (user.empty() || pass.empty()) {
+                response = jsonResponse(401,
+                    "{\"status\":\"error\","
+                    "\"message\":\"Missing credentials\"}");
             } else {
-                // CACHE MISS — query DB
-                bool ok  = db.checkUser(user, pass);
-                string color = ok ? "#2ecc71" : "#e74c3c";
-                string status = ok ? "SUCCESS" : "FAILED";
-                string msg = ok
-                    ? "Welcome, " + user + "!"
-                    : "Invalid credentials!";
+                // Check cache first
+                string cacheKey = "auth:" + user + pass;
+                string cached   = cache.get(cacheKey);
+                bool   ok;
 
-                body =
-                    "<!DOCTYPE html><html><body style='"
-                    "font-family:Arial;display:flex;"
-                    "justify-content:center;align-items:"
-                    "center;height:100vh;margin:0;"
-                    "background:#1a1a2e'>"
-                    "<div style='text-align:center;"
-                    "color:white'>"
-                    "<h1 style='color:" + color
-                    + "'>Login " + status + "</h1>"
-                    "<p style='font-size:24px'>"
-                    + msg + "</p>"
-                    "<p>Worker: <b>" + to_string(wid)
-                    + "</b> | Source: <b style='color:"
-                    "#e67e22'>DATABASE</b></p>"
-                    "<br>"
-                    "<a href='/users' style='color:#3498db'>"
-                    "Users</a> | "
-                    "<a href='/logs' style='color:#3498db'>"
-                    "Logs</a> | "
-                    "<a href='/cache' style='color:#f39c12'>"
-                    "Cache Stats</a>"
-                    "</div></body></html>";
+                if (!cached.empty()) {
+                    ok = (cached == "true");
+                    cout << "[Worker " << wid
+                         << "] Auth from CACHE!\n";
+                } else {
+                    ok = db.checkUser(user, pass);
+                    cache.put(cacheKey,
+                              ok ? "true" : "false");
+                }
 
-                // Store result in cache
-                cache.put(cacheKey, body);
-            }
-
-            // Update source label if from cache
-            if (fromCache) {
-                body =
-                    "<!DOCTYPE html><html><body style='"
-                    "font-family:Arial;display:flex;"
-                    "justify-content:center;align-items:"
-                    "center;height:100vh;margin:0;"
-                    "background:#1a1a2e'>"
-                    "<div style='text-align:center;"
-                    "color:white'>"
-                    "<h2 style='color:#f39c12'>"
-                    "Served from LRU CACHE!</h2>"
-                    "<p style='font-size:20px'>"
-                    "No database query needed</p>"
-                    "<p>Worker: <b>" + to_string(wid)
-                    + "</b> | Source: <b style='color:"
-                    "#2ecc71'>CACHE (instant)</b></p>"
-                    "<br>"
-                    "<a href='/users' style='color:#3498db'>"
-                    "Users</a> | "
-                    "<a href='/logs' style='color:#3498db'>"
-                    "Logs</a> | "
-                    "<a href='/cache' style='color:#f39c12'>"
-                    "Cache Stats</a>"
-                    "</div></body></html>";
+                if (ok) {
+                    string token =
+                        tokenMgr.generateToken(user);
+                    response = jsonResponse(200,
+                        "{\"status\":\"success\","
+                        "\"message\":\"Login successful\","
+                        "\"token\":\"" + token + "\","
+                        "\"username\":\"" + user + "\"}");
+                } else {
+                    response = jsonResponse(401,
+                        "{\"status\":\"error\","
+                        "\"message\":"
+                        "\"Invalid credentials\"}");
+                }
             }
             db.logRequest(path, label, wid);
         }
 
-        // ── ROUTE: /users ─────────────────
-        else if (path == "/users") {
-            string cached = cache.get("page:/users");
-            if (!cached.empty()) {
-                body      = cached;
-                fromCache = true;
+        // ══════════════════════════════════
+        //  GET /api/users  (requires token)
+        // ══════════════════════════════════
+        else if (method == "GET" &&
+                 path == "/api/users") {
+
+            string token = extractToken(headers);
+            string user  = tokenMgr.validateToken(token);
+
+            if (user.empty()) {
+                response = jsonResponse(401,
+                    "{\"status\":\"error\","
+                    "\"message\":\"Invalid or missing "
+                    "token. Login first.\"}");
             } else {
-                string table = db.getUsers();
-                body =
-                    "<!DOCTYPE html><html><body style='"
-                    "font-family:Arial;padding:30px;"
-                    "background:#1a1a2e;color:white'>"
-                    "<h1 style='color:#2ecc71'>"
-                    "Users Table</h1>"
-                    "<p style='color:#e67e22'>"
-                    "Source: DATABASE</p>"
-                    + table +
-                    "<br><a href='/' style='color:#3498db'>"
-                    "Home</a> | "
-                    "<a href='/cache' style='color:#f39c12'>"
-                    "Cache Stats</a>"
-                    "</body></html>";
-                cache.put("page:/users", body);
-            }
-            if (fromCache) {
-                string table = db.getUsers();
-                body =
-                    "<!DOCTYPE html><html><body style='"
-                    "font-family:Arial;padding:30px;"
-                    "background:#1a1a2e;color:white'>"
-                    "<h1 style='color:#2ecc71'>"
-                    "Users Table</h1>"
-                    "<p style='color:#2ecc71'>"
-                    "Source: LRU CACHE (instant!)</p>"
-                    + table +
-                    "<br><a href='/' style='color:#3498db'>"
-                    "Home</a> | "
-                    "<a href='/cache' style='color:#f39c12'>"
-                    "Cache Stats</a>"
-                    "</body></html>";
+                // Check cache
+                string cached = cache.get("users_json");
+                string json;
+                if (!cached.empty()) {
+                    json = cached;
+                    cout << "[Worker " << wid
+                         << "] Users from CACHE!\n";
+                } else {
+                    json = db.getUsersJSON();
+                    cache.put("users_json", json);
+                }
+                response = jsonResponse(200,
+                    "{\"status\":\"success\","
+                    "\"requested_by\":\"" + user + "\","
+                    "\"users\":" + json + "}");
             }
             db.logRequest(path, label, wid);
         }
 
-        // ── ROUTE: /logs ──────────────────
-        else if (path == "/logs") {
-            // Logs always fresh — no cache
-            // (data changes every request)
-            cache.invalidate("page:/logs");
-            string table = db.getLogs();
-            body =
-                "<!DOCTYPE html><html><body style='"
-                "font-family:Arial;padding:30px;"
-                "background:#1a1a2e;color:white'>"
-                "<h1 style='color:#3498db'>"
-                "Request Logs</h1>"
-                "<p style='color:#e67e22'>"
-                "Always fresh — cache disabled for logs</p>"
-                + table +
-                "<br><a href='/' style='color:#3498db'>"
-                "Home</a> | "
-                "<a href='/cache' style='color:#f39c12'>"
-                "Cache Stats</a>"
-                "</body></html>";
+        // ══════════════════════════════════
+        //  GET /api/logs  (requires token)
+        // ══════════════════════════════════
+        else if (method == "GET" &&
+                 path == "/api/logs") {
+
+            string token = extractToken(headers);
+            string user  = tokenMgr.validateToken(token);
+
+            if (user.empty()) {
+                response = jsonResponse(401,
+                    "{\"status\":\"error\","
+                    "\"message\":\"Unauthorized\"}");
+            } else {
+                cache.invalidate("logs_json");
+                string json = db.getLogsJSON();
+                response = jsonResponse(200,
+                    "{\"status\":\"success\","
+                    "\"requested_by\":\"" + user + "\","
+                    "\"logs\":" + json + "}");
+            }
             db.logRequest(path, label, wid);
         }
 
-        // ── ROUTE: /cache (stats page) ────
-        else if (path == "/cache") {
-            cache.printStats();
-            int total = cache.hits + cache.misses;
-            float rate = total > 0
-                ? (float)cache.hits / total * 100 : 0;
+        // ══════════════════════════════════
+        //  DELETE /api/logout
+        // ══════════════════════════════════
+        else if (method == "DELETE" &&
+                 path == "/api/logout") {
 
-            body =
-                "<!DOCTYPE html><html><body style='"
-                "font-family:Arial;padding:30px;"
-                "background:#1a1a2e;color:white'>"
-                "<h1 style='color:#f39c12'>"
-                "LRU Cache Statistics</h1>"
-                "<table border='1' style='border-collapse:"
-                "collapse;width:50%;color:white'>"
-                "<tr style='background:#f39c12;color:black'>"
-                "<th>Metric</th><th>Value</th></tr>"
-                "<tr><td>Cache Hits</td><td style='color:"
-                "#2ecc71'><b>" + to_string(cache.hits)
-                + "</b></td></tr>"
-                "<tr><td>Cache Misses</td><td style='color:"
-                "#e74c3c'><b>" + to_string(cache.misses)
-                + "</b></td></tr>"
-                "<tr><td>Total Requests</td><td><b>"
-                + to_string(total) + "</b></td></tr>"
-                "<tr><td>Hit Rate</td><td style='color:"
-                "#f39c12'><b>" + to_string((int)rate)
-                + "%</b></td></tr>"
-                "<tr><td>Cache Capacity</td><td><b>"
-                + to_string(cache.capacity)
-                + " items</b></td></tr>"
-                "</table>"
-                "<br><p style='color:#aaa'>Visit same URL "
-                "twice to see cache hit!</p>"
-                "<a href='/' style='color:#3498db'>Home</a>"
-                "</body></html>";
+            string token = extractToken(headers);
+            bool   ok    = tokenMgr.deleteToken(token);
+
+            if (ok) {
+                response = jsonResponse(200,
+                    "{\"status\":\"success\","
+                    "\"message\":\"Logged out "
+                    "successfully\"}");
+            } else {
+                response = jsonResponse(401,
+                    "{\"status\":\"error\","
+                    "\"message\":\"Token not found\"}");
+            }
+            db.logRequest(path, label, wid);
         }
 
-        // ── ROUTE: / (Home) ───────────────
-        else {
-            db.logRequest(path, label, wid);
-            body =
+        // ══════════════════════════════════
+        //  GET / — API Dashboard (HTML)
+        // ══════════════════════════════════
+        else if (path == "/" || path == "") {
+            string activeTokens = tokenMgr.listTokens();
+            string htmlBody =
                 "<!DOCTYPE html><html><body style='"
-                "font-family:Arial;display:flex;"
-                "justify-content:center;align-items:"
-                "center;height:100vh;margin:0;"
-                "background:#1a1a2e'>"
-                "<div style='text-align:center;"
-                "color:white'>"
-                "<h1 style='color:#f39c12'>SOSBS</h1>"
+                "font-family:Arial;padding:40px;"
+                "background:#1a1a2e;color:white'>"
+                "<h1 style='color:#f39c12'>SOSBS "
+                "REST API</h1>"
                 "<p style='color:#aaa'>Smart OS-Aware "
-                "Scalable Backend System</p><br>"
-                "<p><a href='/login?user=yash&pass=1234' "
-                "style='color:#2ecc71;font-size:18px'>"
-                "Login as Yash</a></p>"
-                "<p><a href='/login?user=admin&pass=admin123'"
-                " style='color:#2ecc71;font-size:18px'>"
-                "Login as Admin</a></p>"
-                "<p><a href='/login?user=fake&pass=wrong' "
-                "style='color:#e74c3c;font-size:18px'>"
-                "Login (Wrong)</a></p>"
-                "<p><a href='/users' "
-                "style='color:#3498db;font-size:18px'>"
-                "Users Table</a></p>"
-                "<p><a href='/logs' "
-                "style='color:#3498db;font-size:18px'>"
-                "Request Logs</a></p>"
-                "<p><a href='/cache' "
-                "style='color:#f39c12;font-size:18px'>"
-                "Cache Statistics</a></p>"
-                "</div></body></html>";
+                "Scalable Backend System — Phase 6</p>"
+                "<hr style='border-color:#333'>"
+
+                "<h2 style='color:#2ecc71'>"
+                "Available Endpoints</h2>"
+                "<table border='1' style='border-collapse"
+                ":collapse;width:100%'>"
+                "<tr style='background:#27ae60'>"
+                "<th>Method</th><th>Endpoint</th>"
+                "<th>Auth</th><th>Description</th></tr>"
+                "<tr><td style='color:#3498db'>POST</td>"
+                "<td>/api/login</td><td>No</td>"
+                "<td>Login → get token</td></tr>"
+                "<tr><td style='color:#2ecc71'>GET</td>"
+                "<td>/api/users</td><td>Yes</td>"
+                "<td>Get all users</td></tr>"
+                "<tr><td style='color:#2ecc71'>GET</td>"
+                "<td>/api/logs</td><td>Yes</td>"
+                "<td>Get request logs</td></tr>"
+                "<tr><td style='color:#e74c3c'>DELETE</td>"
+                "<td>/api/logout</td><td>Yes</td>"
+                "<td>Logout + delete token</td></tr>"
+                "</table>"
+
+                "<h2 style='color:#3498db'>"
+                "How to Test (Postman)</h2>"
+                "<p><b style='color:#f39c12'>Step 1 — "
+                "Login:</b><br>"
+                "POST http://localhost:8080/api/login<br>"
+                "Body (JSON): {\"username\":\"yash\","
+                "\"password\":\"1234\"}<br>"
+                "→ Copy the token from response</p>"
+                "<p><b style='color:#f39c12'>Step 2 — "
+                "Get Users:</b><br>"
+                "GET http://localhost:8080/api/users<br>"
+                "Header: Authorization: Bearer "
+                "YOUR_TOKEN_HERE</p>"
+                "<p><b style='color:#f39c12'>Step 3 — "
+                "Logout:</b><br>"
+                "DELETE http://localhost:8080/api/logout<br>"
+                "Header: Authorization: Bearer "
+                "YOUR_TOKEN_HERE</p>"
+
+                "<h2 style='color:#e67e22'>"
+                "Active Tokens</h2><pre style='color:#aaa'>"
+                + activeTokens + "</pre>"
+                "<h2 style='color:#9b59b6'>"
+                "Cache Stats</h2>"
+                "<p>Hits: <b style='color:#2ecc71'>"
+                + to_string(cache.hits) + "</b> | "
+                "Misses: <b style='color:#e74c3c'>"
+                + to_string(cache.misses) + "</b></p>"
+                "</body></html>";
+            response = htmlResponse(htmlBody);
+            db.logRequest(path, label, wid);
         }
 
-        string response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/html\r\n"
-            "Content-Length: " + to_string(body.size())
-            + "\r\n"
-            "Connection: close\r\n"
-            "\r\n" + body;
+        // ══════════════════════════════════
+        //  404 — Unknown route
+        // ══════════════════════════════════
+        else {
+            response = jsonResponse(404,
+                "{\"status\":\"error\","
+                "\"message\":\"Route not found\","
+                "\"available\":[\"/api/login\","
+                "\"/api/users\",\"/api/logs\","
+                "\"/api/logout\"]}");
+        }
 
         send(req.socket, response.c_str(),
              response.size(), 0);
@@ -572,6 +652,8 @@ private:
 //  MAIN
 // ─────────────────────────────────────────
 int main() {
+    srand(time(NULL));  // for token randomness
+
     WSADATA wsa;
     SOCKET  server_fd;
     struct sockaddr_in address;
@@ -590,8 +672,8 @@ int main() {
 
     if (bind(server_fd, (struct sockaddr*)&address,
              sizeof(address)) == SOCKET_ERROR) {
-        cout << "Bind failed! " << WSAGetLastError()
-             << "\n"; return 1;
+        cout << "Bind failed! "
+             << WSAGetLastError() << "\n"; return 1;
     }
     if (listen(server_fd, 10) == SOCKET_ERROR) {
         cout << "Listen failed!\n"; return 1;
@@ -599,16 +681,15 @@ int main() {
 
     ThreadPool pool(4);
 
-    cout << "\n========================================\n";
-    cout << "  SOSBS Server — http://localhost:8080\n";
-    cout << "  Phase 5: LRU Cache ACTIVE\n";
-    cout << "----------------------------------------\n";
-    cout << "  /              → Home\n";
-    cout << "  /login?user=yash&pass=1234\n";
-    cout << "  /users         → Users table\n";
-    cout << "  /logs          → Request logs\n";
-    cout << "  /cache         → Cache statistics\n";
-    cout << "========================================\n\n";
+    cout << "\n╔══════════════════════════════════╗\n";
+    cout << "║   SOSBS Server — Phase 6 READY  ║\n";
+    cout << "║   http://localhost:8080          ║\n";
+    cout << "╠══════════════════════════════════╣\n";
+    cout << "║ POST   /api/login                ║\n";
+    cout << "║ GET    /api/users  (token needed)║\n";
+    cout << "║ GET    /api/logs   (token needed)║\n";
+    cout << "║ DELETE /api/logout (token needed)║\n";
+    cout << "╚══════════════════════════════════╝\n\n";
 
     while (true) {
         int addrlen   = sizeof(address);
